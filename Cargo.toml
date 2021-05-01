@@ -23,7 +23,7 @@ protoc-grpcio = "1.0.1"
 protobuf-codegen = "2.5"
 
 [dependencies]
-byteorder = "1.0.0"
+byteorder = "1.4.3"
 bytes = "0.4"
 either = "1.5.3"
 env_logger = "0.6"
