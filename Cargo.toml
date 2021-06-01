@@ -43,7 +43,7 @@ pool = "0.1.4"
 protobuf = { version = "~2.7", features = ["with-bytes"] }
 rand = { version = "0.7", features = ["small_rng"] }
 serde = "1.0.0"
-serde_derive = "1.0.0"
+serde_derive = "1.0.126"
 slab = "0.4.0"
 tokio = "0.1.6"
 tokio-io = "0.1.6"
