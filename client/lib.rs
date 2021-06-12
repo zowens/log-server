@@ -1,12 +1,12 @@
 #![feature(test)]
 extern crate bytes;
-extern crate test;
-#[macro_use]
 extern crate futures;
+extern crate test;
 #[macro_use]
 extern crate log;
 extern crate fnv;
 extern crate grpcio;
+extern crate pin_project;
 extern crate protobuf;
 extern crate rand;
 extern crate tokio;
@@ -15,54 +15,17 @@ mod append;
 mod protocol;
 
 use bytes::Bytes;
-use futures::future::Join;
-use futures::{Async, Future, Poll};
+use futures::join;
 use grpcio::{ChannelBuilder, EnvBuilder, Environment};
 use protocol::*;
+use std::cmp::min;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::{io, mem, time};
-use tokio::timer::Delay;
+use std::time::Duration;
+use tokio::time::sleep;
 
 pub use protocol::{AppendSentFuture, LatestOffsetFuture, QueryFuture, Reply, ReplyStream};
-
-// TODO: use exponential backoff
-const SNAPSHOT_BACKOFF_DELAY: time::Duration = time::Duration::from_secs(1);
-
-pub struct AppendFuture(AppendFutureState, append::Receiver);
-
-enum AppendFutureState {
-    Sending(AppendSentFuture),
-    Waiting,
-}
-
-impl Future for AppendFuture {
-    type Item = ();
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<(), io::Error> {
-        loop {
-            match mem::replace(&mut self.0, AppendFutureState::Waiting) {
-                AppendFutureState::Sending(mut f) => match f.poll()? {
-                    Async::Ready(_) => {}
-                    Async::NotReady => {
-                        self.0 = AppendFutureState::Sending(f);
-                        return Ok(Async::NotReady);
-                    }
-                },
-                AppendFutureState::Waiting => match self.1.poll() {
-                    Ok(Async::Ready(_)) | Err(_) => {
-                        // TODO: handle err
-                        return Ok(Async::Ready(()));
-                    }
-                    Ok(Async::NotReady) => {
-                        return Ok(Async::NotReady);
-                    }
-                },
-            };
-        }
-    }
-}
 
 // TODO: repoll configuration from the management server
 pub struct Connection {
@@ -72,30 +35,33 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn append(&mut self, body: Bytes) -> AppendFuture {
-        let (client_request_id, res) = self.req_mgr.push_req();
+    pub async fn append(&mut self, body: Bytes) -> Result<(), io::Error> {
+        let (client_request_id, response) = self.req_mgr.push_req().await;
 
         let mut append_req = AppendRequest::new();
         append_req.set_payload(body);
         append_req.set_client_id(self.req_mgr.client_id());
         append_req.set_client_request_id(client_request_id);
 
-        let sent = AppendSentFuture::new(self.head_conn.append_async(&append_req));
-        AppendFuture(AppendFutureState::Sending(sent), res)
+        AppendSentFuture::new(self.head_conn.append_async(&append_req)).await?;
+        response.await.map_err(|e| {
+            error!("Error appending: {:?}", e);
+            io::Error::new(io::ErrorKind::Other, "Error appending")
+        })
     }
 
-    pub fn raw_append(
+    pub async fn raw_append(
         &mut self,
         client_id: u64,
         client_request_id: u64,
         payload: Bytes,
-    ) -> AppendSentFuture {
+    ) -> Result<(), io::Error> {
         let mut append_req = AppendRequest::new();
         append_req.set_payload(payload);
         append_req.set_client_id(client_id);
         append_req.set_client_request_id(client_request_id);
 
-        AppendSentFuture::new(self.head_conn.append_async(&append_req))
+        AppendSentFuture::new(self.head_conn.append_async(&append_req)).await
     }
 
     pub fn raw_replies(&mut self, client_id: u64) -> ReplyStream {
@@ -104,28 +70,36 @@ impl Connection {
         self.tail_conn.replies(&reply_req).unwrap().into()
     }
 
-    pub fn read(&mut self, start_offset: u64, max_bytes: u32) -> QueryFuture {
+    pub async fn read(
+        &mut self,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<(u64, Bytes)>, io::Error> {
         let mut read_req = QueryRequest::new();
         read_req.set_start_offset(start_offset);
         read_req.set_max_bytes(max_bytes);
-        QueryFuture::new(self.tail_conn.query_log_async(&read_req))
+        QueryFuture::new(self.tail_conn.query_log_async(&read_req)).await
     }
 
-    pub fn latest_offset(&mut self) -> LatestOffsetFuture {
+    pub async fn latest_offset(&mut self) -> Result<Option<u64>, io::Error> {
         let query = LatestOffsetQuery::new();
-        LatestOffsetFuture::new(self.tail_conn.latest_offset_async(&query))
+        LatestOffsetFuture::new(self.tail_conn.latest_offset_async(&query)).await
     }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq)]
 pub struct Configuration {
     management_server: SocketAddr,
+    initial_delay: Duration,
+    max_delay: Duration,
 }
 
 impl Default for Configuration {
     fn default() -> Configuration {
         Configuration {
             management_server: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5000),
+            initial_delay: Duration::from_millis(250),
+            max_delay: Duration::from_secs(5),
         }
     }
 }
@@ -145,7 +119,8 @@ impl Configuration {
 
 fn connect(env: Arc<Environment>, addr: &str) -> LogStorageClient {
     let cb = ChannelBuilder::new(env)
-        .default_compression_algorithm(grpcio::CompressionAlgorithms::None)
+        // TODO: compress?
+        .default_compression_algorithm(grpcio::CompressionAlgorithms::GRPC_COMPRESS_NONE)
         .max_concurrent_stream(1000)
         .http2_bdp_probe(true);
     let conn = cb.connect(addr);
@@ -154,7 +129,7 @@ fn connect(env: Arc<Environment>, addr: &str) -> LogStorageClient {
 
 fn connect_management_server(env: Arc<Environment>, addr: &SocketAddr) -> ConfigurationClient {
     let cb = ChannelBuilder::new(env)
-        .default_compression_algorithm(grpcio::CompressionAlgorithms::Gzip)
+        .default_compression_algorithm(grpcio::CompressionAlgorithms::GRPC_COMPRESS_STREAM_GZIP)
         .max_concurrent_stream(10)
         .http2_bdp_probe(true);
     let conn = cb.connect(&format!("{}:{}", addr.ip(), addr.port()));
@@ -175,102 +150,103 @@ impl LogServerClient {
         }
     }
 
-    pub fn new_connection(&self) -> ClientConnectFuture {
+    pub async fn new_connection(&self) -> Result<Connection, io::Error> {
         let client = connect_management_server(self.env.clone(), &self.config.management_server);
-        let snapshot_future = client.snapshot_async(&protocol::ClientNodeRequest::new());
-        debug!("Requesting configuration from management server");
-        ClientConnectFuture {
-            state: ClientConnectState::RequestingConfiguration(ClientConfigurationFuture::new(
-                snapshot_future,
-            )),
-            management_client: client,
-            env: self.env.clone(),
+
+        let mut delay = ConnectBackoff::new(&self.config);
+
+        // grab the nodes from the management server (loop until there are at least 2)
+        let snapshot = loop {
+            debug!("Requesting configuration from management server");
+
+            let snapshot_call = client
+                .snapshot_async(&protocol::ClientNodeRequest::new())
+                .map_err(|e| {
+                    warn!("Error getting snapshot from management server: {:?}", e);
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid construction of snapshot call",
+                    )
+                })?;
+
+            match snapshot_call.await {
+                Ok(snapshot) if snapshot.nodes.len() >= 2 => break snapshot,
+                Ok(snapshot) => warn!(
+                    "Awaiting more nodes, current count = {}, must be at least 2",
+                    snapshot.nodes.len()
+                ),
+                Err(e) => warn!("Error getting configuration, adding delay {:?}", e),
+            };
+
+            delay.backoff().await;
+        };
+
+        let head_addr = snapshot.nodes.first().unwrap().get_client_address();
+        let tail_addr = snapshot.nodes.last().unwrap().get_client_address();
+        debug!(
+            "Configuration found from management server, head={}, tail={}",
+            head_addr, tail_addr
+        );
+
+        let head_conn = connect(self.env.clone(), head_addr);
+        let tail_conn = connect(self.env.clone(), tail_addr);
+
+        // force connection open by querying for the latest offset
+        loop {
+            let head_latest = {
+                let query = LatestOffsetQuery::new();
+                LatestOffsetFuture::new(head_conn.latest_offset_async(&query))
+            };
+
+            let tail_latest = {
+                let query = LatestOffsetQuery::new();
+                LatestOffsetFuture::new(tail_conn.latest_offset_async(&query))
+            };
+
+            match join!(head_latest, tail_latest) {
+                (Ok(_), Ok(_)) => {
+                    let req_mgr = append::RequestManager::start(&tail_conn)?;
+                    return Ok(Connection { req_mgr, head_conn, tail_conn });
+                }
+                (head_res, tail_res) => {
+                    if let Err(e) = head_res {
+                        warn!("Error connecting to the head: {:?}", e);
+                    }
+
+                    if let Err(e) = tail_res {
+                        warn!("Error connecting to the tail: {:?}", e);
+                    }
+
+                    delay.backoff().await;
+                }
+            }
         }
     }
 }
 
-enum ClientConnectState {
-    RequestingConfiguration(protocol::ClientConfigurationFuture),
-    Backoff(Delay),
-    OpeningConnections {
-        requests: Join<LatestOffsetFuture, LatestOffsetFuture>,
-        connections: Option<(LogStorageClient, LogStorageClient)>,
-    },
+struct ConnectBackoff {
+    delay: Option<Duration>,
+    initial_duration: Duration,
+    max_duration: Duration,
 }
 
-pub struct ClientConnectFuture {
-    state: ClientConnectState,
-    management_client: ConfigurationClient,
-    env: Arc<Environment>,
-}
-
-impl Future for ClientConnectFuture {
-    type Item = Connection;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        loop {
-            let next_state = match self.state {
-                ClientConnectState::RequestingConfiguration(ref mut cfg_future) => {
-                    let nodes = try_ready!(cfg_future.poll()).take_nodes().into_vec();
-
-                    if nodes.len() >= 2 {
-                        let head_addr = nodes.first().unwrap().get_client_address();
-                        let tail_addr = nodes.last().unwrap().get_client_address();
-                        debug!(
-                            "Configuration found from management server, head={}, tail={}",
-                            head_addr, tail_addr
-                        );
-
-                        let head = connect(self.env.clone(), head_addr);
-                        let tail = connect(self.env.clone(), tail_addr);
-
-                        // force connection open by querying for the latest offset
-                        let query = LatestOffsetQuery::new();
-                        let head_latest = LatestOffsetFuture::new(head.latest_offset_async(&query));
-                        let query = LatestOffsetQuery::new();
-                        let tail_latest = LatestOffsetFuture::new(tail.latest_offset_async(&query));
-                        ClientConnectState::OpeningConnections {
-                            requests: head_latest.join(tail_latest),
-                            connections: Some((head, tail)),
-                        }
-                    } else {
-                        debug!("No head or tail found in configuration, adding delay");
-                        ClientConnectState::Backoff(Delay::new(
-                            time::Instant::now() + SNAPSHOT_BACKOFF_DELAY,
-                        ))
-                    }
-                }
-                ClientConnectState::Backoff(ref mut delay) => {
-                    try_ready!(delay
-                        .poll()
-                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "timer error")));
-                    debug!("Requesting configuration from management server");
-                    let snapshot_future = self
-                        .management_client
-                        .snapshot_async(&protocol::ClientNodeRequest::new());
-                    ClientConnectState::RequestingConfiguration(ClientConfigurationFuture::new(
-                        snapshot_future,
-                    ))
-                }
-                ClientConnectState::OpeningConnections {
-                    ref mut connections,
-                    ref mut requests,
-                } => {
-                    try_ready!(requests.poll());
-                    let (head_conn, tail_conn) = connections
-                        .take()
-                        .expect("Multiple calls to poll after ready");
-                    debug!("Connections to head and tail succeeded");
-                    let req_mgr = append::RequestManager::start(&tail_conn)?;
-                    return Ok(Async::Ready(Connection {
-                        head_conn,
-                        tail_conn,
-                        req_mgr,
-                    }));
-                }
-            };
-            self.state = next_state;
+impl ConnectBackoff {
+    fn new(config: &Configuration) -> ConnectBackoff {
+        ConnectBackoff {
+            delay: None,
+            initial_duration: config.initial_delay,
+            max_duration: config.max_delay,
         }
+    }
+
+    async fn backoff(&mut self) {
+        let delay = min(
+            self.max_duration,
+            self.delay
+                .map(|v| v + v)
+                .unwrap_or_else(|| self.initial_duration),
+        );
+        self.delay = Some(delay);
+        sleep(delay).await;
     }
 }

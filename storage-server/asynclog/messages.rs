@@ -83,11 +83,6 @@ impl Messages {
         }
     }
 
-    #[inline]
-    pub fn into_inner(self) -> Bytes {
-        self.bytes
-    }
-
     /// Next offset to be appended.
     #[inline]
     pub fn next_offset(&self) -> Option<Offset> {
@@ -102,7 +97,7 @@ impl AsRef<[u8]> for Messages {
 }
 
 /// Mutable message set based on `BytesMut`.
-pub struct MessagesMut(pub BytesMut);
+pub struct MessagesMut(BytesMut);
 
 impl From<BytesMut> for MessagesMut {
     fn from(bytes: BytesMut) -> MessagesMut {
@@ -142,6 +137,10 @@ impl MessagesMut {
         }
     }
 
+    pub fn into_inner(self) -> BytesMut {
+        self.0
+    }
+
     /// Insert a new log entry to the message set.
     #[inline]
     pub fn push<B: AsRef<[u8]>>(
@@ -152,8 +151,13 @@ impl MessagesMut {
     ) -> Result<(), MessagePushError> {
         let payload_bytes = payload.as_ref();
 
-        if rare!(payload_bytes.len() + METADATA_SIZE + HEADER_SIZE > self.0.capacity()) {
+        let append_size = payload_bytes.len() + METADATA_SIZE + HEADER_SIZE;
+        if rare!(append_size > self.0.capacity()) {
             return Err(MessagePushError::MessageExceedsCapacity);
+        }
+
+        if rare!(append_size + self.0.len() > self.0.capacity()) {
+            return Err(MessagePushError::OutOfCapacity);
         }
 
         let mut meta = [0u8; METADATA_SIZE];
@@ -164,11 +168,17 @@ impl MessagesMut {
 
     /// Insert a new log entry to the message set without metadata
     #[inline]
+    #[allow(dead_code)]
     pub fn push_no_metadata<B: AsRef<[u8]>>(&mut self, payload: B) -> Result<(), MessagePushError> {
         let payload_bytes = payload.as_ref();
 
-        if rare!(payload_bytes.len() + HEADER_SIZE > self.0.capacity()) {
+        let append_size = payload_bytes.len() + METADATA_SIZE + HEADER_SIZE;
+        if rare!(append_size > self.0.capacity()) {
             return Err(MessagePushError::MessageExceedsCapacity);
+        }
+
+        if rare!(append_size + self.0.len() > self.0.capacity()) {
+            return Err(MessagePushError::OutOfCapacity);
         }
 
         serialize(&mut self.0, 0, &[], payload_bytes).map_err(|_| MessagePushError::OutOfCapacity)
@@ -196,11 +206,12 @@ mod tests {
 
     #[test]
     fn message_mut_push_out_of_capacity() {
-        let mut buf: MessagesMut = BytesMut::with_capacity(48).into();
-        let msg_bytes = [1u8; 10];
+        let mut buf: MessagesMut = BytesMut::with_capacity(51).into();
+        let msg_bytes = [1u8; 15];
         assert!(buf.push(5, 10, &msg_bytes).is_ok());
+        let msg_bytes2 = [1u8; 10];
         assert_eq!(
-            buf.push(5, 11, &msg_bytes),
+            buf.push(1000, 11, &msg_bytes2),
             Err(MessagePushError::OutOfCapacity)
         );
     }
@@ -227,4 +238,29 @@ mod tests {
         let meta = msg.metadata();
         assert_eq!(0, meta.len());
     }
+
+    #[test]
+    fn message_mut_push_multiple_messages() {
+        let mut buf: MessagesMut = BytesMut::with_capacity(512).into();
+        buf.push_no_metadata(b"0123456789").unwrap();
+        buf.push_no_metadata(b"----------").unwrap();
+
+        assert_eq!(2, buf.len());
+
+        let mut iter = buf.iter();
+        {
+            let msg = iter.next().unwrap();
+            assert_eq!(b"0123456789", msg.payload());
+            let meta = msg.metadata();
+            assert_eq!(0, meta.len());
+        }
+        {
+            let msg = iter.next().unwrap();
+            assert_eq!(b"----------", msg.payload());
+            let meta = msg.metadata();
+            assert_eq!(0, meta.len());
+        }
+        assert!(iter.next().is_none());
+    }
+
 }

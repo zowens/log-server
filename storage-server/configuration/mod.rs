@@ -1,12 +1,14 @@
-use config::Config;
-use futures::{Async, Future, Poll};
-use grpcio;
-use grpcio::{ChannelBuilder, EnvBuilder, Error as GrpcError, RpcStatus, RpcStatusCode};
-use protocol;
+use crate::config::Config;
+use crate::protocol;
+use crate::retry::{Retry, RetryBehavior};
+use futures::{ready, Future};
+use grpcio::{ChannelBuilder, EnvBuilder};
+use pin_project::pin_project;
 use rand::{thread_rng, Rng};
-use retry::{Retry, RetryBehavior, RetryPoll};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 const DEFAULT_WAIT_DURATION: Duration = Duration::from_secs(5);
@@ -16,6 +18,7 @@ pub struct NodeConfiguration<'a> {
 }
 
 impl<'a> NodeConfiguration<'a> {
+    #[allow(dead_code)]
     pub fn is_head(&self) -> bool {
         assert!(self.config.quorum > 0);
         assert!(self.config.has_self_node());
@@ -25,6 +28,7 @@ impl<'a> NodeConfiguration<'a> {
             && id == self.config.active_chain.iter().next().unwrap().id
     }
 
+    #[allow(dead_code)]
     pub fn is_tail(&self) -> bool {
         assert!(self.config.quorum > 0);
         assert!(self.config.has_self_node());
@@ -104,115 +108,92 @@ impl NodeManager {
             let config = self.current_config.read().unwrap();
             config.get_self_node().get_id()
         };
-        let mut poll_req = protocol::PollRequest::new();
-        poll_req.set_node_id(node_id);
-        let poll_fut = self.client.poll_async(&poll_req).unwrap();
+
+        let client = self.client.clone();
         NodeConfigFuture {
             current_config: self.current_config.clone(),
-            client: self.client.clone(),
-            request: poll_req,
-            future: RetryBehavior::forever().retry(poll_fut),
+            future: RetryBehavior::forever().retry(Box::new(move || {
+                let mut poll_req = protocol::PollRequest::new();
+                poll_req.set_node_id(node_id);
+                client.poll_async(&poll_req).unwrap()
+            })),
         }
     }
 }
 
+#[pin_project]
 pub struct NodeConfigFuture {
-    client: protocol::ConfigurationClient,
-    request: protocol::PollRequest,
     current_config: Arc<RwLock<protocol::NodeConfiguration>>,
+    #[pin]
     future: Retry<grpcio::ClientUnaryReceiver<protocol::NodeConfiguration>>,
 }
 
 impl Future for NodeConfigFuture {
-    type Item = ();
-    type Error = ();
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<(), ()> {
-        loop {
-            match self.future.poll_next() {
-                RetryPoll::FinalResult(config) => {
-                    let mut v = self.current_config.write().unwrap();
-                    *v = config;
-                    return Ok(Async::Ready(()));
-                }
-                RetryPoll::AsyncNotReady => return Ok(Async::NotReady),
-                RetryPoll::Retry(e) => {
-                    error!("Error polling for configuration, retrying: {}", e);
-                    let fut = self.client.poll_async(&self.request).unwrap();
-                    self.future.set_future(fut);
-                }
-                RetryPoll::FinalError(e) => {
-                    error!("Error polling for configuration: {}", e);
-                    return Err(());
-                }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        match ready!(this.future.poll(cx)) {
+            Ok(config) => {
+                let mut v = this.current_config.write().unwrap();
+                *v = config;
+                Poll::Ready(())
             }
+            Err(_) => unreachable!("This future is retried forever"),
         }
     }
 }
 
+#[pin_project(project_replace)]
 pub struct ClusterJoin {
-    join_req: protocol::JoinRequest,
+    #[pin]
     future: Retry<grpcio::ClientUnaryReceiver<protocol::NodeConfiguration>>,
     client: protocol::ConfigurationClient,
 }
 
 impl ClusterJoin {
     pub fn new(config: &Config) -> ClusterJoin {
+        let config = config.clone();
+
         let cb = ChannelBuilder::new(Arc::new(EnvBuilder::new().build()))
-            .default_compression_algorithm(grpcio::CompressionAlgorithms::Gzip)
+            .default_compression_algorithm(grpcio::CompressionAlgorithms::GRPC_COMPRESS_GZIP)
             .max_concurrent_stream(100)
             .http2_bdp_probe(true);
         let conn = cb.connect(&config.management.management_server_addr);
-        let client = protocol::ConfigurationClient::new(conn);
 
-        let mut join_req = protocol::JoinRequest::new();
-        join_req.set_replication_address(config.replication.server_addr.to_string());
-        join_req.set_client_address(config.frontend.server_addr.to_string());
-        join_req.set_node_id(thread_rng().gen());
-        let join_fut = client.join_async(&join_req).unwrap();
+        let client = protocol::ConfigurationClient::new(conn);
+        let retry_behavior = RetryBehavior::forever()
+            .max_backoff(Duration::from_secs(4))
+            .initial_backoff(Duration::from_millis(500))
+            .disable_jitter();
+
         ClusterJoin {
-            join_req,
-            future: RetryBehavior::forever()
-                .max_backoff(Duration::from_secs(4))
-                .initial_backoff(Duration::from_millis(500))
-                .disable_jitter()
-                .retry(join_fut),
-            client,
+            client: client.clone(),
+            future: retry_behavior.retry(Box::new(move || {
+                let mut join_req = protocol::JoinRequest::new();
+                join_req.set_replication_address(config.replication.server_addr.to_string());
+                join_req.set_client_address(config.frontend.server_addr.to_string());
+
+                // pick a random node on every retry to prevent duplicates
+                join_req.set_node_id(thread_rng().gen());
+
+                client.join_async(&join_req).unwrap()
+            })),
         }
     }
 }
 
 impl Future for ClusterJoin {
-    type Item = NodeManager;
-    type Error = ();
+    type Output = NodeManager;
 
-    fn poll(&mut self) -> Poll<NodeManager, ()> {
-        loop {
-            match self.future.poll_next() {
-                RetryPoll::FinalResult(config) => {
-                    info!("Joined cluster. id={}", config.get_self_node().get_id());
-                    return Ok(Async::Ready(NodeManager::new(config, self.client.clone())));
-                }
-                RetryPoll::FinalError(e) => {
-                    error!("Error joining cluster {}", e);
-                    return Err(());
-                }
-                RetryPoll::AsyncNotReady => return Ok(Async::NotReady),
-                RetryPoll::Retry(GrpcError::RpcFailure(RpcStatus {
-                    status: RpcStatusCode::AlreadyExists,
-                    ..
-                })) => {
-                    error!("Duplicate node ID, trying with another");
-                    self.join_req.set_node_id(thread_rng().gen());
-                    let fut = self.client.join_async(&self.join_req).unwrap();
-                    self.future.set_future(fut);
-                }
-                RetryPoll::Retry(e) => {
-                    warn!("Error joining cluster, retrying: {}", e);
-                    let fut = self.client.join_async(&self.join_req).unwrap();
-                    self.future.set_future(fut);
-                }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<NodeManager> {
+        let this = self.project();
+        match ready!(this.future.poll(cx)) {
+            Ok(config) => {
+                info!("Joined cluster. id={}", config.get_self_node().get_id());
+                Poll::Ready(NodeManager::new(config, this.client.clone()))
             }
+            Err(_) => unreachable!("Configured for forever retries"),
         }
     }
 }

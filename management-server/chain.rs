@@ -1,9 +1,12 @@
-use config::FailureDetection;
+use crate::config::FailureDetection;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::{spawn, task::JoinHandle, time::sleep};
 
 /// Default number of nodes to be considered available
 const DEFAULT_QUORUM: u32 = 2;
+
+const WAIT_DURATION: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Metadata for a storage server node
@@ -29,20 +32,12 @@ pub enum NodeState {
 
 impl NodeState {
     fn is_joining(&self) -> bool {
-        if let NodeState::Joining { .. } = *self {
-            true
-        } else {
-            false
-        }
+        matches!(*self, NodeState::Joining { .. })
     }
 
     #[allow(unused)]
     fn is_active(&self) -> bool {
-        if let NodeState::Active { .. } = *self {
-            true
-        } else {
-            false
-        }
+        matches!(*self, NodeState::Active { .. })
     }
 }
 
@@ -127,6 +122,16 @@ impl Chain {
         }
     }
 
+    pub fn spawn_failure_detector(&self) -> JoinHandle<()> {
+        let chain = self.clone();
+        spawn(async move {
+            loop {
+                sleep(WAIT_DURATION).await;
+                chain.node_reaper();
+            }
+        })
+    }
+
     /// Join a node to the cluster
     pub fn join(&self, mut node: Node) -> Result<PollState, JoinError> {
         let mut state = self.state.write().unwrap();
@@ -158,7 +163,7 @@ impl Chain {
                 // figure out state of the node
                 // - force into active state if no other nodes
                 // - force into joining state if other nodes AND not already in joining state
-                if state.active_nodes.len() == 0 {
+                if state.active_nodes.is_empty() {
                     node.state = NodeState::Active {
                         last_poll: Instant::now(),
                     };
@@ -193,7 +198,7 @@ impl Chain {
                 .active_nodes
                 .iter_mut()
                 .find(|state| state.id == id)
-                .ok_or_else(|| PollError::NoNodeFound)?;
+                .ok_or(PollError::NoNodeFound)?;
 
             node.state = NodeState::Active {
                 last_poll: Instant::now(),
@@ -487,5 +492,4 @@ mod tests {
             },
         }
     }
-
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod manage;
 mod manage_grpc;
 mod storage;
@@ -8,9 +9,11 @@ pub use self::manage_grpc::ConfigurationClient;
 pub use self::storage::*;
 pub use self::storage_grpc::LogStorageClient;
 use bytes::Bytes;
-use futures::{Async, Future, Poll, Stream};
-use grpcio;
+use futures::{Future, Stream};
+use pin_project::pin_project;
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 macro_rules! wrap_future {
     ($name:ident, $rpc_ty:ty, $result_ty:ty, $res_var:ident, $map:expr) => {
@@ -23,32 +26,31 @@ macro_rules! wrap_future {
         }
 
         impl Future for $name {
-            type Item = $result_ty;
-            type Error = io::Error;
+            type Output = Result<$result_ty, io::Error>;
 
-            fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-                match &mut self.0 {
-                    Ok(ref mut f) => match f.poll() {
-                        Ok(Async::Ready($res_var)) => {
-                            trace!("[response] {:?}", $res_var);
-                            Ok(Async::Ready($map))
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                match &mut self.get_mut().0 {
+                    &mut Ok(ref mut rec) => {
+                        let pin_receiver = unsafe { Pin::new_unchecked(rec) };
+                        match pin_receiver.poll(cx) {
+                            Poll::Ready(Ok($res_var)) => {
+                                trace!("[response] {:?}", $res_var);
+                                Poll::Ready(Ok($map))
+                            }
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(Err(e)) => {
+                                error!("Error with server: {:?}", e);
+                                Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Invalid payload",
+                                )))
+                            }
                         }
-                        Ok(Async::NotReady) => Ok(Async::NotReady),
-                        Err(e) => {
-                            error!("Error with server: {:?}", e);
-                            Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Invalid payload",
-                            ))
-                        }
-                    },
-                    Err(e) => {
-                        error!("Error with server: {:?}", e);
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Invalid payload",
-                        ))
                     }
+                    &mut Err(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid payload",
+                    ))),
                 }
             }
         }
@@ -82,23 +84,24 @@ wrap_future!(
 
 wrap_future!(AppendSentFuture, AppendAck, (), _res, ());
 
-pub struct ReplyStream(grpcio::ClientSStreamReceiver<Reply>);
+#[pin_project]
+pub struct ReplyStream(#[pin] grpcio::ClientSStreamReceiver<Reply>);
 
 impl Stream for ReplyStream {
-    type Item = Reply;
-    type Error = io::Error;
+    type Item = Result<Reply, io::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Reply>, io::Error> {
-        match self.0.poll() {
-            Ok(Async::Ready(v)) => Ok(Async::Ready(v)),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => {
-                error!("Error with server: {:?}", e);
-                Err(io::Error::new(
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.project().0.poll_next(cx) {
+            Poll::Ready(Some(Err(e))) => {
+                error!("Error polling for reply stream value: {:?}", e);
+                Poll::Ready(Some(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid payload",
-                ))
+                ))))
             }
+            Poll::Ready(Some(Ok(v))) => Poll::Ready(Some(Ok(v))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

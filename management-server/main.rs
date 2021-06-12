@@ -8,23 +8,21 @@ extern crate serde;
 extern crate serde_derive;
 extern crate env_logger;
 extern crate tokio;
-extern crate tokio_signal;
 extern crate toml;
 
 mod chain;
 mod config;
-mod failure_detector;
 mod handle;
 mod protocol;
 
 use config::Config;
-use failure_detector::FailureDetector;
-use futures::{Future, Stream};
+use futures::FutureExt;
 use grpcio::{Environment, ServerBuilder};
 use std::io::Read;
 use std::process::exit;
 use std::sync::Arc;
 use std::{env, fs, str};
+use tokio::signal;
 
 fn load_config() -> Config {
     let args: Vec<String> = env::args().collect();
@@ -46,7 +44,8 @@ fn load_config() -> Config {
     config
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::init();
 
     let Config {
@@ -68,20 +67,15 @@ fn main() {
         .unwrap();
     server.start();
 
-    for &(ref host, port) in server.bind_addrs() {
+    for (host, port) in server.bind_addrs() {
         info!("listening on {}:{}", host, port);
     }
 
     // wait for sigint and run failure detection on this thread
-    let ctrl_c = tokio_signal::ctrl_c()
-        .flatten_stream()
-        .into_future()
-        .map(|_| ())
-        .map_err(|_| ());
+    let ctrl_c = signal::ctrl_c().map(|_| ());
 
-    let failure_detector = FailureDetector::new(chain);
-    tokio::runtime::current_thread::block_on_all(failure_detector.select(ctrl_c))
-        .map_err(|_| ())
-        .expect("unable to capture ctrl-c");
-    server.shutdown().wait().unwrap();
+    let failure_detector = chain.spawn_failure_detector();
+    ctrl_c.await;
+    server.shutdown().await.unwrap();
+    failure_detector.abort();
 }

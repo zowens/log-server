@@ -1,6 +1,4 @@
 use commitlog::{message::MessageError, reader::LogSliceReader};
-use libc;
-use nix;
 use nix::errno::Errno;
 use std::fs::File;
 use std::io;

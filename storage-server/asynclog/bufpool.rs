@@ -1,6 +1,8 @@
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use prometheus::Counter;
 use std::collections::VecDeque;
+use std::rc::Rc;
+use std::cell::RefCell;
 
 lazy_static! {
     static ref UNPOOLED_BUFFER_CREATE: Counter = register_counter!(
@@ -11,9 +13,10 @@ lazy_static! {
 }
 
 /// Pool for writable bytes
+#[derive(Clone)]
 pub struct BytesPool {
     buf_capacity: usize,
-    unused: VecDeque<Bytes>,
+    unused: Rc<RefCell<VecDeque<BytesMut>>>,
 }
 
 impl BytesPool {
@@ -21,7 +24,7 @@ impl BytesPool {
     pub fn new(buf_capacity: usize) -> BytesPool {
         BytesPool {
             buf_capacity,
-            unused: VecDeque::new(),
+            unused: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
 
@@ -35,26 +38,23 @@ impl BytesPool {
     pub fn take(&mut self) -> BytesMut {
         // try to pull from the front, if that doesn't
         // work assume that the rest aren't drained either
-        // TODO: would it be more effective to go through the whole queue?
-        let front_bytes = self.unused.pop_front().map(|bytes| bytes.try_mut());
+        let front_bytes = self.unused.borrow_mut().pop_front();
         match front_bytes {
-            Some(Ok(mut bytes_mut)) => {
+            Some(mut bytes_mut) => {
                 bytes_mut.clear();
                 bytes_mut
             }
-            Some(Err(bytes)) => {
+            None => {
                 UNPOOLED_BUFFER_CREATE.inc();
-                self.unused.push_front(bytes);
                 BytesMut::with_capacity(self.buf_capacity)
             }
-            None => BytesMut::with_capacity(self.buf_capacity),
         }
     }
 
     /// Return an unused buffer, which may have outstanding references.
     #[inline]
-    pub fn push(&mut self, buf: Bytes) {
-        self.unused.push_back(buf);
+    pub fn push(&mut self, buf: BytesMut) {
+        self.unused.borrow_mut().push_back(buf);
     }
 }
 
@@ -81,31 +81,11 @@ mod tests {
 
         let data_ptr = buf.as_ptr();
 
-        pool.push(buf.freeze());
+        pool.push(buf);
 
         let buf = pool.take();
         assert_eq!(1024, buf.capacity());
         assert_eq!(0, buf.len());
         assert_eq!(data_ptr, buf.as_ptr());
-    }
-
-    #[test]
-    fn take_fresh_buf_with_returned_not_fully_returned() {
-        let mut pool = BytesPool::new(1024);
-        let mut buf = pool.take();
-        buf.put_slice(b"test");
-        assert_eq!(1024, buf.capacity());
-        assert_eq!(4, buf.len());
-
-        let data_ptr = buf.as_ptr();
-
-        // the bytes are cloned, so it cannot be reused mutably
-        let first_buf = buf.freeze();
-        pool.push(first_buf.clone());
-
-        let buf = pool.take();
-        assert_eq!(1024, buf.capacity());
-        assert_eq!(0, buf.len());
-        assert!(data_ptr != buf.as_ptr());
     }
 }

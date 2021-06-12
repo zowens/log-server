@@ -1,122 +1,72 @@
 use super::log_reader::FileSlice;
 use super::poll::UpstreamReplication;
-use asynclog::ReplicatorAsyncLog;
-use configuration::{NodeConfigFuture, NodeManager};
-use either::Either;
-use futures::future::Either as EitherFut;
-use futures::future::Select2;
-use futures::stream::StreamFuture;
-use futures::{Async, Future, Poll, Stream};
-use std::mem;
-use std::time::Instant;
-use tokio::timer::Delay;
-
-// use tokio::timer::Deadline
-
-enum ControllerState {
-    WaitingForAssignment(RepollFuture, ReplicatorAsyncLog<FileSlice>),
-    Replicating(Select2<RepollFuture, UpstreamReplication>),
-    Empty,
-}
+use crate::asynclog::ReplicatorAsyncLog;
+use crate::configuration::{NodeConfigFuture, NodeManager};
+use futures::ready;
+use futures::{pin_mut, stream::StreamExt, Future, Stream};
+use pin_project::pin_project;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::time::{sleep, Sleep};
 
 pub struct ReplicationController {
     manager: NodeManager,
-    state: ControllerState,
+    log: ReplicatorAsyncLog<FileSlice>,
 }
 
 impl ReplicationController {
     pub fn new(manager: NodeManager, log: ReplicatorAsyncLog<FileSlice>) -> ReplicationController {
-        let repoll = Repoll::new(&manager).into_future();
-        let state = {
-            let current_config = manager.current();
-            match current_config.upstream_addr() {
-                Some(addr) => ControllerState::Replicating(
-                    repoll.select2(UpstreamReplication::new(&addr, log)),
-                ),
-                None => ControllerState::WaitingForAssignment(repoll, log),
-            }
-        };
-        ReplicationController { manager, state }
+        ReplicationController { manager, log }
     }
-}
 
-impl Future for ReplicationController {
-    type Item = ();
-    type Error = ();
+    pub async fn run(self) {
+        let reassignment_stream = Repoll::new(&self.manager);
+        pin_mut!(reassignment_stream);
 
-    fn poll(&mut self) -> Poll<(), ()> {
+        let mut log = self.log;
+
         loop {
-            let state = mem::replace(&mut self.state, ControllerState::Empty);
-            self.state = match state {
-                ControllerState::Empty => unreachable!("Reached Empty state"),
-                ControllerState::WaitingForAssignment(mut repoll, log) => match repoll.poll() {
-                    Ok(Async::Ready((_, repoll_stream))) => {
-                        match self.manager.current().upstream_addr() {
-                            Some(addr) => {
-                                info!("Assigned upstream address={}", addr);
-                                ControllerState::Replicating(
-                                    repoll_stream
-                                        .into_future()
-                                        .select2(UpstreamReplication::new(&addr, log)),
-                                )
-                            }
-                            None => ControllerState::WaitingForAssignment(
-                                repoll_stream.into_future(),
-                                log,
-                            ),
-                        }
-                    }
-                    Ok(Async::NotReady) => {
-                        self.state = ControllerState::WaitingForAssignment(repoll, log);
-                        return Ok(Async::NotReady);
-                    }
-                    Err(_) => return Err(()),
-                },
-                ControllerState::Replicating(mut select_future) => match select_future.poll() {
-                    Ok(Async::Ready(EitherFut::A(((_, repoll_stream), replication)))) => {
-                        let repoll = repoll_stream.into_future();
+            // wait for an assignment for the upstream node
+            //
+            // A head node will continuously poll until there is a node
+            // that is upstream of this node
+            while self.manager.current().upstream_addr().is_none() {
+                reassignment_stream.next().await;
+            }
 
-                        // check if upstream needs to be changed
-                        match self.manager.current().upstream_addr() {
-                            Some(addr) if addr == replication.address() => {
-                                trace!("No change in upstream replication address");
-                                ControllerState::Replicating(repoll.select2(replication))
-                            }
-                            Some(addr) => {
-                                info!("Replication changed to address={}", addr);
-                                ControllerState::Replicating(repoll.select2(
-                                    UpstreamReplication::new(&addr, replication.into_async_log()),
-                                ))
-                            }
-                            None => {
-                                info!("Removing upstream replication, upgraded to head node");
-                                ControllerState::WaitingForAssignment(
-                                    repoll,
-                                    replication.into_async_log(),
-                                )
-                            }
-                        }
-                    }
-                    Ok(Async::Ready(EitherFut::B(_))) => {
-                        error!("Error replicating, future ended");
-                        unreachable!("Replication should not have ended");
-                    }
-                    Ok(Async::NotReady) => {
-                        self.state = ControllerState::Replicating(select_future);
-                        return Ok(Async::NotReady);
-                    }
-                    Err(_) => return Err(()),
-                },
+            // primary loop
+            let upstream_addr = self.manager.current().upstream_addr().unwrap();
+
+            let replication_future = UpstreamReplication::new(&upstream_addr, &mut log).replicate();
+            pin_mut!(replication_future);
+            tokio::select! {
+                // check for reassignment
+                _ = reassignment_stream.next() => {
+                    info!("Replication changed");
+                }
+                // drive the replication
+                _ = &mut replication_future => {
+                    panic!("Unreachable");
+                }
             }
         }
     }
 }
 
-type RepollFuture = StreamFuture<Repoll>;
-
+#[pin_project]
 struct Repoll {
     manager: NodeManager,
-    state: Either<Delay, NodeConfigFuture>,
+    prev_upstream: Option<SocketAddr>,
+
+    #[pin]
+    state: RepollState,
+}
+
+#[pin_project(project = RepollStateProj, project_replace = RepollStateProjOwned)]
+enum RepollState {
+    Delay(#[pin] Sleep),
+    RequestConfig(#[pin] NodeConfigFuture),
 }
 
 impl Repoll {
@@ -124,39 +74,51 @@ impl Repoll {
         let delay = manager.current().wait_duration();
         Repoll {
             manager: manager.clone(),
-            state: Either::Left(Delay::new(Instant::now() + delay)),
+            prev_upstream: None,
+            state: RepollState::Delay(sleep(delay)),
         }
+    }
+
+    fn poll_next_state(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<(RepollState, bool)> {
+        let this = self.as_mut().project();
+        let state = match this.state.project() {
+            RepollStateProj::Delay(sleep) => {
+                ready!(sleep.poll(cx));
+                (RepollState::RequestConfig(this.manager.repoll()), false)
+            }
+            RepollStateProj::RequestConfig(config_future) => {
+                ready!(config_future.poll(cx));
+                let prev_upstream = *this.prev_upstream;
+                *this.prev_upstream = this.manager.current().upstream_addr();
+                (
+                    RepollState::Delay(sleep(this.manager.current().wait_duration())),
+                    prev_upstream == *this.prev_upstream,
+                )
+            }
+        };
+        Poll::Ready(state)
     }
 }
 
 impl Stream for Repoll {
     type Item = ();
-    type Error = ();
 
-    fn poll(&mut self) -> Poll<Option<()>, ()> {
-        loop {
-            let next_state = match self.state {
-                Either::Left(ref mut delay) => match delay.poll() {
-                    Ok(Async::Ready(_)) => Either::Right(self.manager.repoll()),
-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
-                    Err(_) => return Err(()),
-                },
-                Either::Right(ref mut reconfig) => match reconfig.poll() {
-                    Ok(Async::Ready(_)) => {
-                        let delay = self.manager.current().wait_duration();
-                        Either::Left(Delay::new(Instant::now() + delay))
-                    }
-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
-                    Err(_) => return Err(()),
-                },
-            };
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+        let (next_state, reconfigured) = {
+            let this = self.as_mut();
+            ready!(this.poll_next_state(cx))
+        };
+        self.as_mut().project().state.set(next_state);
 
-            self.state = next_state;
-
-            // HACK: using the fact that right->left transition means configuration changed
-            if self.state.is_left() {
-                return Ok(Async::Ready(Some(())));
-            }
+        // only send an update when the upstream changes
+        if reconfigured {
+            Poll::Ready(Some(()))
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
 }

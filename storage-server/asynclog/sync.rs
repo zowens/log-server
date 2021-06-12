@@ -1,6 +1,9 @@
-use futures::{Async, Future, Poll};
+use futures::Future;
+use pin_project::pin_project;
 use std::io::{Error, ErrorKind};
-use tokio_sync::oneshot;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 
 pub struct LogSender<T> {
     s: oneshot::Sender<Result<T, Error>>,
@@ -24,26 +27,23 @@ impl<T> LogSender<T> {
 }
 
 /// `LogFuture` waits for a response from the `CommitLog`.
+#[pin_project]
 pub struct LogFuture<R> {
+    #[pin]
     f: oneshot::Receiver<Result<R, Error>>,
 }
 
 impl<R> Future for LogFuture<R> {
-    type Item = R;
-    type Error = Error;
+    type Output = Result<R, Error>;
 
-    fn poll(&mut self) -> Poll<R, Error> {
-        match self.f.poll() {
-            Ok(Async::Ready(Ok(v))) => Ok(Async::Ready(v)),
-            Ok(Async::Ready(Err(e))) => {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project().f.poll(cx) {
+            Poll::Ready(Ok(v)) => Poll::Ready(v),
+            Poll::Ready(Err(e)) => {
                 error!("Inner error {}", e);
-                Err(e)
+                Poll::Ready(Err(Error::new(ErrorKind::Other, "Cancelled")))
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => {
-                error!("Encountered cancellation: {:?}", e);
-                Err(Error::new(ErrorKind::Other, "Cancelled"))
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }

@@ -1,8 +1,7 @@
-use asynclog::ReplicatorAsyncLog;
-use futures::{Future, Stream};
-use std::net::SocketAddr;
-use tokio;
+use crate::asynclog::ReplicatorAsyncLog;
+use futures::{pin_mut, sink::SinkExt, stream::StreamExt};
 use tokio::net::TcpListener;
+use tokio::net::ToSocketAddrs;
 
 mod client;
 mod controller;
@@ -16,30 +15,52 @@ pub mod log_reader;
 pub use self::controller::ReplicationController;
 pub use self::log_reader::{FileSlice, FileSliceMessageReader};
 
-pub fn server(
-    addr: &SocketAddr,
+pub async fn server<T: ToSocketAddrs>(
+    addr: T,
     log: ReplicatorAsyncLog<FileSlice>,
-) -> impl Future<Item = (), Error = ()> {
-    let listener =
-        TcpListener::bind(addr).expect("unable to bind TCP listener for replication server");
-    listener
-        .incoming()
-        .map_err(|e| error!("accept failed = {:?}", e))
-        .for_each(move |sock| {
-            let mut log = log.clone();
-
-            if let Err(e) = sock.set_nodelay(true) {
-                warn!("Unable to set nodelay on socket: {}", e);
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    loop {
+        let socket = match listener.accept().await {
+            Ok((socket, _)) => socket,
+            Err(e) => {
+                error!("accept failed = {:?}", e);
+                continue;
             }
+        };
 
-            let (request_stream, write_buf) = self::io::replication_framed(sock);
+        let mut log = log.clone();
 
-            let handle_conn = request_stream
-                .and_then(move |req| log.replicate_from(req.starting_offset))
-                .forward(write_buf)
-                .map_err(|e| error!("Connection error: {}", e))
-                .map(|_| trace!("Connection closed"));
+        if let Err(e) = socket.set_nodelay(true) {
+            warn!("Unable to set nodelay on socket: {}", e);
+        }
 
-            tokio::spawn(handle_conn)
-        })
+        tokio::spawn(async move {
+            let (mut request_stream, write_buf) = self::io::replication_framed(socket);
+            pin_mut!(write_buf);
+            loop {
+                let offset = match request_stream.next().await {
+                    Some(Ok(req)) => req.starting_offset,
+                    None => {
+                        trace!("Connection closed");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        error!("Connection error: {}", e);
+                        break;
+                    }
+                };
+
+                let output = match log.replicate_from(offset).await {
+                    Ok(output) => output,
+                    Err(_) => break,
+                };
+
+                if let Err(e) = write_buf.send(output).await {
+                    error!("Connection error: {}", e);
+                    break;
+                }
+            }
+        });
+    }
 }

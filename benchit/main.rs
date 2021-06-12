@@ -1,7 +1,6 @@
 #![allow(unknown_lints)]
 extern crate client;
 extern crate env_logger;
-#[macro_use]
 extern crate futures;
 extern crate getopts;
 extern crate histogram;
@@ -10,20 +9,19 @@ extern crate log;
 extern crate bytes;
 extern crate rand;
 extern crate tokio;
+extern crate tokio_stream;
 
 use bytes::Bytes;
-use client::{AppendSentFuture, Configuration, Connection, LogServerClient};
-use futures::stream::poll_fn;
-use futures::{Async, Future, Poll, Stream};
+use client::{Configuration, Connection, LogServerClient};
+use futures::stream::StreamExt;
 use getopts::Options;
 use rand::{distributions::Alphanumeric, rngs::SmallRng, Rng, SeedableRng};
-use std::cell::RefCell;
 use std::env;
 use std::process::exit;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tokio::runtime::current_thread::Runtime;
-use tokio::timer::Interval;
+use tokio::time::{interval, sleep};
+use tokio::{runtime::Runtime, spawn};
+use tokio_stream::wrappers::IntervalStream;
 
 macro_rules! to_ms {
     ($e:expr) => {
@@ -61,68 +59,53 @@ struct Metrics {
 }
 
 impl Metrics {
-    pub fn spawn(
-        mut conn: Connection,
-        start_instant: Instant,
-        msg_size: usize,
-    ) -> impl Future<Item = (), Error = ()> {
+    pub async fn spawn(mut conn: Connection, start_instant: Instant, msg_size: usize) {
         let replies = conn.raw_replies(0);
-        let metrics = Rc::new(RefCell::new(Metrics {
+        tokio::pin!(replies);
+
+        let periodic_report = IntervalStream::new(interval(Duration::from_secs(10)));
+        tokio::pin!(periodic_report);
+
+        let mut metrics = Metrics {
             state: histogram::Histogram::default(),
             conn,
             msg_size,
-        }));
-
-        let periodic_report = {
-            let metrics = metrics.clone();
-            let wait = Duration::from_secs(10);
-            Interval::new(Instant::now() + wait, wait)
-                .map(move |_| {
-                    if let Err(e) = metrics.borrow_mut().snapshot() {
-                        error!("ERROR with metrics snapshot: {}", e);
-                    }
-                })
-                .map_err(|e| {
-                    error!("ERROR with timer: {}", e);
-                })
         };
 
-        let replies = {
-            let mut reply_stream = replies.map_err(|e| {
-                error!("ERROR with reply stream: {}", e);
-            });
-
-            poll_fn(move || -> Poll<Option<()>, ()> {
-                // Capture the relative nanoseconds since the test start.
-                let since_start = (Instant::now() - start_instant).as_nanos() as u64;
-                while let Some(v) = try_ready!(reply_stream.poll()) {
-                    let mut metrics = metrics.borrow_mut();
-                    for t in v.client_request_ids {
-                        // We take the two deltas since the start
-                        // and capture the difference to get the
-                        // amount of time it took end-to-end
-                        metrics.incr(since_start - t);
+        loop {
+            tokio::select! {
+                _ = &mut periodic_report.next() => {
+                    metrics.snapshot();
+                },
+                reply = &mut replies.next() => {
+                    let since_start = (Instant::now() - start_instant).as_nanos() as u64;
+                    match reply {
+                        Some(Ok(reply)) => {
+                            // We take the two deltas since the start
+                            // and capture the difference to get the
+                            // amount of time it took end-to-end
+                            reply.client_request_ids.iter().for_each(|t| metrics.incr(since_start - t));
+                        },
+                        Some(Err(e)) => error!("Error processing reply: {:?}", e),
+                        None => warn!("Reply stream comopleted"),
                     }
-                }
-                Ok(Async::Ready(None))
-            })
-        };
-
-        periodic_report.select(replies).for_each(|_| Ok(()))
+                },
+            }
+        }
     }
 
     fn incr(&mut self, nanos: u64) {
         self.state.increment(nanos).unwrap();
     }
 
-    fn snapshot(&mut self) -> Result<(), &str> {
+    fn snapshot(&mut self) {
         let (requests, p95, p99, p999, max) = {
             let v = (
                 self.state.entries(),
-                self.state.percentile(95.0)?,
-                self.state.percentile(99.0)?,
-                self.state.percentile(99.9)?,
-                self.state.maximum()?,
+                self.state.percentile(95.0).unwrap_or(0),
+                self.state.percentile(99.0).unwrap_or(0),
+                self.state.percentile(99.9).unwrap_or(0),
+                self.state.maximum().unwrap_or(0),
             );
             self.state.clear();
             v
@@ -138,7 +121,6 @@ impl Metrics {
             to_ms!(p999),
             to_ms!(max)
         );
-        Ok(())
     }
 }
 
@@ -167,7 +149,7 @@ impl BenchOptions {
 
         let matches = match opts.parse(&args[1..]) {
             Ok(m) => m,
-            Err(f) => panic!(f.to_string()),
+            Err(f) => panic!("{}", f.to_string()),
         };
 
         if matches.opt_present("h") {
@@ -181,10 +163,10 @@ impl BenchOptions {
             .unwrap_or_else(|| "127.0.0.1:5000".to_string());
 
         let throughput = matches.opt_str("t").unwrap_or_else(|| "10".to_string());
-        let throughput = u32::from_str_radix(throughput.as_str(), 10).unwrap();
+        let throughput = throughput.as_str().parse::<u32>().unwrap();
 
         let bytes = matches.opt_str("b").unwrap_or_else(|| "100".to_string());
-        let bytes = u32::from_str_radix(bytes.as_str(), 10).unwrap() as usize;
+        let bytes = bytes.as_str().parse::<u32>().unwrap() as usize;
 
         BenchOptions {
             management_server_addr: mgmt_addr,
@@ -194,44 +176,17 @@ impl BenchOptions {
     }
 }
 
-enum AppenderState {
-    Sending(AppendSentFuture),
-    Waiting,
-}
-
-struct Appender {
-    start_instant: Instant,
-    conn: Connection,
-    interval: Interval,
-    state: AppenderState,
-    rand: Bytes,
-}
-
-impl Future for Appender {
-    type Item = ();
-    type Error = ();
-
-    fn poll(&mut self) -> Poll<(), ()> {
-        loop {
-            let next_state = match self.state {
-                AppenderState::Sending(ref mut f) => {
-                    try_ready!(f.poll().map_err(|_| ()));
-                    AppenderState::Waiting
-                }
-                AppenderState::Waiting => {
-                    try_ready!(self.interval.poll().map_err(|_| ()));
-                    // IMPORTANT!!!!!
-                    // To benchmark, we've selected the request ID to be the
-                    // nanoseconds since the start in relative terms. When
-                    // the reply is captured, the histogram is incremented
-                    // with the time delta.
-                    let since_start = Instant::now() - self.start_instant;
-                    let req_id = since_start.as_nanos() as u64;
-                    AppenderState::Sending(self.conn.raw_append(0, req_id, self.rand.clone()))
-                }
-            };
-            self.state = next_state;
-        }
+async fn run_appender(mut conn: Connection, rand: Bytes, wait: Duration, start_instant: Instant) {
+    loop {
+        let since_start = Instant::now() - start_instant;
+        let req_id = since_start.as_nanos() as u64;
+        // IMPORTANT!!!!!
+        // To benchmark, we've selected the request ID to be the
+        // nanoseconds since the start in relative terms. When
+        // the reply is captured, the histogram is incremented
+        // with the time delta.
+        conn.raw_append(0, req_id, rand.clone()).await.unwrap();
+        sleep(wait).await;
     }
 }
 
@@ -244,66 +199,36 @@ pub fn main() {
     client_config
         .management_server(&opts.management_server_addr)
         .unwrap();
-    let client = LogServerClient::new(client_config);
 
-    let mut rt = Runtime::new().unwrap();
-    let start_instant = Instant::now();
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async move {
+        let start_instant = Instant::now();
+        let client = LogServerClient::new(client_config);
+        let mut throughput = opts.throughput;
+        let mut rand = RandomSource::new(opts.bytes);
+        // spawn connections that run ever 1ms
+        while throughput > 1000 {
+            throughput -= 1000;
 
-    let msg_size = opts.bytes;
-    rt.spawn(
-        client
-            .new_connection()
-            .map_err(|e| {
-                error!("Error opening connection: {}", e);
-            })
-            .and_then(move |conn| Metrics::spawn(conn, start_instant, msg_size)),
-    );
+            let rand: Bytes = rand.random_chars().into();
+            let conn = client.new_connection().await.unwrap();
+            spawn(run_appender(
+                conn,
+                rand,
+                Duration::from_millis(1),
+                start_instant,
+            ));
+        }
 
-    let mut throughput = opts.throughput;
-    let mut rand = RandomSource::new(opts.bytes);
+        if throughput > 0 {
+            let wait = Duration::from_millis((1000 / throughput).into());
+            let rand: Bytes = rand.random_chars().into();
+            let conn = client.new_connection().await.unwrap();
+            spawn(run_appender(conn, rand, wait, start_instant));
+        }
 
-    // spawn connections that run ever 1ms
-    while throughput > 1000 {
-        throughput -= 1000;
-
-        let rand: Bytes = rand.random_chars().into();
-        rt.spawn(
-            client
-                .new_connection()
-                .map_err(|e| {
-                    error!("Error opening connection: {}", e);
-                })
-                .and_then(move |conn| Appender {
-                    conn,
-                    start_instant,
-                    state: AppenderState::Waiting,
-                    interval: Interval::new(
-                        start_instant + Duration::from_millis(1),
-                        Duration::from_millis(1),
-                    ),
-                    rand,
-                }),
-        );
-    }
-
-    if throughput > 0 {
-        let wait = Duration::from_millis((1000 / throughput).into());
-        let rand: Bytes = rand.random_chars().into();
-        rt.spawn(
-            client
-                .new_connection()
-                .map_err(|e| {
-                    error!("Error opening connection: {}", e);
-                })
-                .and_then(move |conn| Appender {
-                    conn,
-                    state: AppenderState::Waiting,
-                    interval: Interval::new(start_instant + wait, wait),
-                    rand,
-                    start_instant,
-                }),
-        );
-    }
-
-    rt.run().unwrap();
+        let msg_size = opts.bytes;
+        let metrics_conn = client.new_connection().await.unwrap();
+        Metrics::spawn(metrics_conn, start_instant, msg_size).await;
+    });
 }

@@ -1,10 +1,15 @@
-use futures::{Async, Future};
+use futures::{future::TryFuture, ready};
+use pin_project::pin_project;
 use rand::{distributions::Uniform, thread_rng, Rng};
 use std::cmp::min;
-use std::time::{Duration, Instant};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 use std::usize;
-use tokio::timer::Delay;
+use tokio::time::{sleep, Sleep};
 
+#[derive(Clone)]
 pub struct RetryBehavior {
     max_retries: usize,
     jitter: bool,
@@ -14,16 +19,19 @@ pub struct RetryBehavior {
 }
 
 impl RetryBehavior {
-    pub fn forever() -> RetryBehavior {
-        let mut b = RetryBehavior::default();
-        b.max_retries = usize::MAX;
-        b
+    pub const fn forever() -> RetryBehavior {
+        RetryBehavior {
+            max_retries: usize::MAX,
+            retry: 0,
+            jitter: true,
+            wait_duration: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(1),
+        }
     }
 
+    #[allow(dead_code)]
     pub fn limited(retries: usize) -> RetryBehavior {
-        let mut b = RetryBehavior::default();
-        b.max_retries = retries;
-        b
+        RetryBehavior { max_retries: retries, ..Default::default() }
     }
 
     pub fn disable_jitter(mut self) -> RetryBehavior {
@@ -42,9 +50,14 @@ impl RetryBehavior {
         self
     }
 
-    pub fn retry<F: Future>(self, future: F) -> Retry<F> {
+    pub fn retry<F>(&self, supplier: Box<dyn Fn() -> F>) -> Retry<F>
+    where
+        F: TryFuture,
+    {
+        let future = supplier();
         Retry {
-            behavior: self,
+            behavior: self.clone(),
+            supplier,
             state: RetryState::Running(future),
         }
     }
@@ -78,51 +91,55 @@ impl Default for RetryBehavior {
     }
 }
 
-enum RetryState<F: Future> {
-    Running(F),
-    Waiting(Option<F::Error>, Delay),
+#[pin_project(project = RetryStatePinned, project_replace = RetryStateOwned)]
+enum RetryState<F: TryFuture> {
+    Running(#[pin] F),
+    Waiting(#[pin] Sleep),
 }
 
-pub struct Retry<F: Future> {
+#[pin_project]
+pub struct Retry<F: TryFuture> {
     behavior: RetryBehavior,
+    supplier: Box<dyn Fn() -> F>,
+    #[pin]
     state: RetryState<F>,
 }
 
-pub enum RetryPoll<I, E> {
-    FinalResult(I),
-    FinalError(E),
-    AsyncNotReady,
-    Retry(E),
-}
+impl<F: Future> Future for Retry<F>
+where
+    F: TryFuture,
+{
+    // TODO: possible output an error stack??
+    type Output = Result<F::Ok, F::Error>;
 
-impl<F: Future> Retry<F> {
-    pub fn set_future(&mut self, future: F) {
-        self.state = RetryState::Running(future);
-    }
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().project();
+        let mut state = this.state;
+        let next_state = match state.as_mut().project() {
+            RetryStatePinned::Running(f) => {
+                let e = match ready!(f.try_poll(cx)) {
+                    Ok(v) => return Poll::Ready(Ok(v)),
+                    Err(e) => e,
+                };
 
-    pub fn poll_next(&mut self) -> RetryPoll<F::Item, F::Error> {
-        loop {
-            let next_state = match self.state {
-                RetryState::Running(ref mut f) => match f.poll() {
-                    Ok(Async::Ready(v)) => return RetryPoll::FinalResult(v),
-                    Ok(Async::NotReady) => return RetryPoll::AsyncNotReady,
-                    Err(e) => match self.behavior.take() {
-                        Some(delay) => {
-                            RetryState::Waiting(Some(e), Delay::new(Instant::now() + delay))
-                        }
-                        None => return RetryPoll::FinalError(e),
-                    },
-                },
-                RetryState::Waiting(ref mut retry_err, ref mut delay) => match delay.poll() {
-                    Ok(Async::Ready(_)) | Err(_) => {
-                        return RetryPoll::Retry(
-                            retry_err.take().expect("Multiple poll_next calls on retry"),
-                        );
-                    }
-                    Ok(Async::NotReady) => return RetryPoll::AsyncNotReady,
-                },
-            };
-            self.state = next_state;
-        }
+                // do another retry, if possible
+                if let Some(delay) = this.behavior.take() {
+                    // trigger a rewake
+                    cx.waker().wake_by_ref();
+
+                    RetryState::Waiting(sleep(delay))
+                } else {
+                    return Poll::Ready(Err(e));
+                }
+            }
+            RetryStatePinned::Waiting(f) => {
+                ready!(f.poll(cx));
+                RetryState::Running((this.supplier)())
+            }
+        };
+
+        cx.waker().wake_by_ref();
+        state.set(next_state);
+        Poll::Pending
     }
 }

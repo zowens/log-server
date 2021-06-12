@@ -14,10 +14,10 @@
 ///!     OpCode     : u8 = 0
 ///!     NextOffset : u64 = <Next Offset to request>
 ///!     MessageBuf : Message*
-use byteorder::ByteOrder;
-use bytes::{Buf, BufMut, BytesMut, IntoBuf, LittleEndian};
+use byteorder::{ByteOrder, LittleEndian};
+use bytes::{Buf, BufMut, BytesMut};
 use std::io;
-use tokio_io::codec::{Decoder, Encoder};
+use tokio_util::codec::{Decoder, Encoder};
 
 /// Request to replicate starting at the next offset
 #[derive(Debug, PartialEq, Eq)]
@@ -84,8 +84,7 @@ fn decode_header(buf: &mut BytesMut) -> Option<(OpCode, BytesMut)> {
 #[derive(Default)]
 pub struct ServerProtocol;
 
-impl Encoder for ServerProtocol {
-    type Item = ReplicationResponseHeader;
+impl Encoder<ReplicationResponseHeader> for ServerProtocol {
     type Error = io::Error;
 
     fn encode(
@@ -105,13 +104,13 @@ impl Decoder for ServerProtocol {
     type Error = io::Error;
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, io::Error> {
         match decode_header(src) {
-            Some((0, buf)) => {
+            Some((0, mut buf)) => {
                 if rare!(buf.len() < 8) {
                     return Err(io::Error::new(io::ErrorKind::Other, "Invalid length"));
                 }
 
                 // read the offset
-                let starting_offset = buf.into_buf().get_u64_le();
+                let starting_offset = buf.get_u64_le();
                 Ok(Some(ReplicationRequest { starting_offset }))
             }
             Some((opcode, _)) => {
@@ -126,8 +125,7 @@ impl Decoder for ServerProtocol {
 #[derive(Default)]
 pub struct ClientProtocol;
 
-impl Encoder for ClientProtocol {
-    type Item = ReplicationRequest;
+impl Encoder<ReplicationRequest> for ClientProtocol {
     type Error = io::Error;
 
     fn encode(&mut self, item: ReplicationRequest, dst: &mut BytesMut) -> Result<(), io::Error> {
@@ -148,7 +146,7 @@ impl Decoder for ClientProtocol {
             Some((0, mut buf)) => {
                 assert!(!buf.is_empty(), "Empty reply from upstream");
                 trace!("Got message set num_bytes={}", buf.len());
-                let latest_log_offset = buf.split_to(8).into_buf().get_u64_le();
+                let latest_log_offset = buf.split_to(8).get_u64_le();
                 Ok(Some(ReplicationResponse {
                     messages: buf,
                     latest_log_offset,

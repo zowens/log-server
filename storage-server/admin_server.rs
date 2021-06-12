@@ -1,13 +1,12 @@
-use futures::{Future, Stream};
-use http::header;
-use hyper::server::conn::Http;
-use hyper::service::service_fn_ok;
-use hyper::{Body, Method, Request, Response, StatusCode};
 use prometheus::{self, Encoder, TextEncoder};
 use std::net::SocketAddr;
-use tokio;
-use tokio::net::TcpListener;
+use std::convert::Infallible;
+use http::Method;
+use http::StatusCode;
+use http::header;
+use hyper::service::{make_service_fn};
 
+/*
 fn handle(req: Request<Body>) -> Response<Body> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/metrics") => {
@@ -31,7 +30,20 @@ fn handle(req: Request<Body>) -> Response<Body> {
     }
 }
 
-pub fn server(addr: &SocketAddr) -> impl Future<Item = (), Error = ()> {
+pub async fn server(addr: &SocketAddr) {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+     let make_service = make_service_fn(|_conn| async {
+        Ok::<_, Infallible>(handle(handle))
+    });
+
+    // Then bind and serve...
+    let server = Server::bind(&addr).serve(make_service);
+
+    // And run forever...
+    if let Err(e) = server.await {
+        eprintln!("server error: {}", e);
+    }
+/*
     let listener = TcpListener::bind(addr).expect("unable to bind TCP listener for admin server");
     listener
         .incoming()
@@ -46,5 +58,5 @@ pub fn server(addr: &SocketAddr) -> impl Future<Item = (), Error = ()> {
                 .serve_connection(sock, service_fn_ok(handle))
                 .map_err(|e| error!("{}", e));
             tokio::spawn(handle_conn)
-        })
-}
+        })*/
+}*/

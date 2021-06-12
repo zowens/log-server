@@ -1,8 +1,8 @@
-use chain::{Chain, ChainView, JoinError, Node, NodeState, PollError, PollState};
-use futures::Future;
+use crate::chain::{Chain, ChainView, JoinError, Node, NodeState, PollError, PollState};
+use crate::protocol;
+use futures::FutureExt;
 use grpcio::{RpcContext, RpcStatus, RpcStatusCode, UnarySink};
 use protobuf::well_known_types::Duration;
-use protocol;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -76,13 +76,13 @@ impl protocol::Configuration for ManagementService {
             },
         };
         match self.0.join(node).map(to_node_configuration) {
-            Ok(config) => ctx.spawn(sink.success(config).map_err(|_| ())),
+            Ok(config) => ctx.spawn(sink.success(config).map(|_| ())),
             Err(JoinError::DuplicateNodeId) => {
                 let status = RpcStatus::new(
-                    RpcStatusCode::AlreadyExists,
+                    RpcStatusCode::ALREADY_EXISTS,
                     Some("Server ID duplicated".to_string()),
                 );
-                ctx.spawn(sink.fail(status).map_err(|_| ()));
+                ctx.spawn(sink.fail(status).map(|_| ()));
             }
         }
     }
@@ -95,14 +95,14 @@ impl protocol::Configuration for ManagementService {
     ) {
         match self.0.poll(req.node_id).map(to_node_configuration) {
             Ok(config) => {
-                ctx.spawn(sink.success(config).map_err(|_| ()));
+                ctx.spawn(sink.success(config).map(|_| ()));
             }
             Err(PollError::NoNodeFound) => {
                 let status = RpcStatus::new(
-                    RpcStatusCode::InvalidArgument,
+                    RpcStatusCode::INVALID_ARGUMENT,
                     Some("Server ID not found".to_string()),
                 );
-                ctx.spawn(sink.fail(status).map_err(|_| ()));
+                ctx.spawn(sink.fail(status).map(|_| ()));
             }
         }
     }
@@ -113,9 +113,6 @@ impl protocol::Configuration for ManagementService {
         _req: protocol::ClientNodeRequest,
         sink: UnarySink<protocol::ClientConfiguration>,
     ) {
-        ctx.spawn(
-            sink.success(map_client_config(self.0.read()))
-                .map_err(|_| ()),
-        );
+        ctx.spawn(sink.success(map_client_config(self.0.read())).map(|_| ()));
     }
 }

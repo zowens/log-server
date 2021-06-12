@@ -9,8 +9,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}/{}", proto_root, proto);
     }
 
-    let mut cust = protobuf_codegen::Customize::default();
-    cust.carllerche_bytes_for_bytes = Some(true);
+    let cust = protobuf_codegen::Customize { carllerche_bytes_for_bytes: Some(true), ..Default::default() };
 
     protoc_grpcio::compile_grpc_protos(
         &protos,
@@ -32,7 +31,7 @@ fn main() {
         &protos,
         &[proto_root],
         "management-server/protocol",
-        Some(cust.clone()),
+        Some(cust),
     )
     .expect("Failed to compile gRPC definitions!");
 }
